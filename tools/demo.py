@@ -19,6 +19,7 @@ from pcdet.datasets import DatasetTemplate
 from pcdet.models import build_network, load_data_to_gpu
 from pcdet.utils import common_utils
 
+from visual_utils import ros_visualizer
 
 class DemoDataset(DatasetTemplate):
     def __init__(self, dataset_cfg, class_names, training=True, root_path=None, logger=None, ext='.bin'):
@@ -45,7 +46,9 @@ class DemoDataset(DatasetTemplate):
 
     def __getitem__(self, index):
         if self.ext == '.bin':
-            points = np.fromfile(self.sample_file_list[index], dtype=np.float32).reshape(-1, 4)
+            # points = np.fromfile(self.sample_file_list[index], dtype=np.float32).reshape(-1, 4)
+            points = np.fromfile(str(self.sample_file_list[index]), dtype=np.float32, count=-1).reshape([-1, 5])[:, :4]
+            points = np.concatenate([points, np.zeros((points.shape[0], 1))], axis=1)
         elif self.ext == '.npy':
             points = np.load(self.sample_file_list[index])
         else:
@@ -96,6 +99,14 @@ def main():
             data_dict = demo_dataset.collate_batch([data_dict])
             load_data_to_gpu(data_dict)
             pred_dicts, _ = model.forward(data_dict)
+
+            # ros_visualizer.visualize_points(points=data_dict['points'][:, 1:5])
+
+            score_threshold = 0.5
+            score_mask = pred_dicts[0]['pred_scores'] > score_threshold
+            pred_dicts[0]['pred_boxes'] = pred_dicts[0]['pred_boxes'][score_mask]
+            pred_dicts[0]['pred_scores'] = pred_dicts[0]['pred_scores'][score_mask]
+            pred_dicts[0]['pred_labels'] = pred_dicts[0]['pred_labels'][score_mask]
 
             V.draw_scenes(
                 points=data_dict['points'][:, 1:], ref_boxes=pred_dicts[0]['pred_boxes'],

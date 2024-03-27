@@ -11,6 +11,8 @@ from ..dataset import DatasetTemplate
 from pyquaternion import Quaternion
 from PIL import Image
 
+from nuscenes.utils.data_classes import RadarPointCloud
+
 
 class NuScenesDataset(DatasetTemplate):
     def __init__(self, dataset_cfg, class_names, training=True, root_path=None, logger=None):
@@ -25,6 +27,12 @@ class NuScenesDataset(DatasetTemplate):
             self.camera_image_config = self.camera_config.IMAGE
         else:
             self.use_camera = False
+
+        self.radar_config = self.dataset_cfg.get('RADAR_CONFIG', None)
+        if self.radar_config is not None:
+            self.use_radar = self.radar_config.get('USE_RADAR', True)
+        else:
+            self.use_radar = False
 
         self.include_nuscenes_data(self.mode)
         if self.training and self.dataset_cfg.get('BALANCED_RESAMPLING', False):
@@ -117,6 +125,51 @@ class NuScenesDataset(DatasetTemplate):
         points = np.concatenate((points, times), axis=1)
         return points
 
+    def get_radar_sweep(self, sweep_info):
+        def remove_ego_points(points, center_radius=1.0):
+            mask = ~((np.abs(points[:, 0]) < center_radius) & (np.abs(points[:, 1]) < center_radius))
+            return points[mask]
+
+        radar_path = self.root_path / sweep_info['radar_path']
+        radar_obj = RadarPointCloud.from_file(str(radar_path))
+        points_sweep = radar_obj.points.transpose().astype(np.float32)
+        points_sweep = remove_ego_points(points_sweep).T
+        if sweep_info['transform_matrix'] is not None:
+            radar_obj.points = points_sweep
+            radar_obj.transform(sweep_info['transform_matrix'])
+            radar_obj.points[8:10, :] = np.dot(sweep_info['transform_matrix'][:2,:2], radar_obj.points[8:10, :])
+            points_sweep = radar_obj.points
+
+        cur_times = sweep_info['time_lag'] * np.ones((1, points_sweep.shape[1]))
+        return points_sweep.T[:, self.radar_config.USE_DIMS], cur_times.T
+    
+    def get_radars_with_sweeps(self, index, max_sweeps=1):
+        info = self.infos[index]
+        sweep_points_list = []
+        sweep_times_list = []
+        for radar, radar_info in info['radars'].items():
+            radar_path = self.root_path / radar_info['data_path']
+            radar_obj = RadarPointCloud.from_file(str(radar_path))
+            if radar_info['transform_matrix'] is not None:
+                radar_obj.transform(radar_info['transform_matrix'])
+                radar_obj.points[8:10, :] = np.dot(radar_info['transform_matrix'][:2,:2], radar_obj.points[8:10, :])
+
+            radar_points = radar_obj.points.transpose().astype(np.float32)[:, self.radar_config.USE_DIMS]
+
+            sweep_points_list.append(radar_points)
+            sweep_times_list.append(radar_info['time_lag'] * np.ones((radar_points.shape[0], 1)))
+            
+            for k in np.random.choice(len(radar_info['sweeps']), max_sweeps - 1, replace=False):
+                points_sweep, times_sweep = self.get_radar_sweep(radar_info['sweeps'][k])
+                sweep_points_list.append(points_sweep)
+                sweep_times_list.append(times_sweep)
+
+        points = np.concatenate(sweep_points_list, axis=0)
+        times = np.concatenate(sweep_times_list, axis=0).astype(points.dtype)
+
+        points = np.concatenate((points, times), axis=1)
+        return points
+    
     def crop_image(self, input_dict):
         W, H = input_dict["ori_shape"]
         imgs = input_dict["camera_imgs"]
@@ -241,6 +294,12 @@ class NuScenesDataset(DatasetTemplate):
         if self.use_camera:
             input_dict = self.load_camera_info(input_dict, info)
 
+        if self.use_radar:
+            radar_points = self.get_radars_with_sweeps(index, max_sweeps=self.radar_config.MAX_SWEEPS)
+            input_dict.update({
+                'radar_points': radar_points,
+            })
+
         data_dict = self.prepare_data(data_dict=input_dict)
 
         if self.dataset_cfg.get('SET_NAN_VELOCITY_TO_ZEROS', False) and 'gt_boxes' in info:
@@ -354,7 +413,7 @@ class NuScenesDataset(DatasetTemplate):
             pickle.dump(all_db_infos, f)
 
 
-def create_nuscenes_info(version, data_path, save_path, max_sweeps=10, with_cam=False):
+def create_nuscenes_info(version, data_path, save_path, max_sweeps=10, with_cam=False, with_radar=False):
     from nuscenes.nuscenes import NuScenes
     from nuscenes.utils import splits
     from . import nuscenes_utils
@@ -386,18 +445,18 @@ def create_nuscenes_info(version, data_path, save_path, max_sweeps=10, with_cam=
 
     train_nusc_infos, val_nusc_infos = nuscenes_utils.fill_trainval_infos(
         data_path=data_path, nusc=nusc, train_scenes=train_scenes, val_scenes=val_scenes,
-        test='test' in version, max_sweeps=max_sweeps, with_cam=with_cam
+        test='test' in version, max_sweeps=max_sweeps, with_cam=with_cam, with_radar=with_radar
     )
 
     if version == 'v1.0-test':
         print('test sample: %d' % len(train_nusc_infos))
-        with open(save_path / f'nuscenes_infos_{max_sweeps}sweeps_test.pkl', 'wb') as f:
+        with open(save_path / f'nuscenes_infos_{max_sweeps}sweeps_cam({with_cam})_radar({with_radar})_test.pkl', 'wb') as f:
             pickle.dump(train_nusc_infos, f)
     else:
         print('train sample: %d, val sample: %d' % (len(train_nusc_infos), len(val_nusc_infos)))
-        with open(save_path / f'nuscenes_infos_{max_sweeps}sweeps_train.pkl', 'wb') as f:
+        with open(save_path / f'nuscenes_infos_{max_sweeps}sweeps_cam({with_cam})_radar({with_radar})_train.pkl', 'wb') as f:
             pickle.dump(train_nusc_infos, f)
-        with open(save_path / f'nuscenes_infos_{max_sweeps}sweeps_val.pkl', 'wb') as f:
+        with open(save_path / f'nuscenes_infos_{max_sweeps}sweeps_cam({with_cam})_radar({with_radar})_val.pkl', 'wb') as f:
             pickle.dump(val_nusc_infos, f)
 
 
@@ -412,6 +471,7 @@ if __name__ == '__main__':
     parser.add_argument('--func', type=str, default='create_nuscenes_infos', help='')
     parser.add_argument('--version', type=str, default='v1.0-trainval', help='')
     parser.add_argument('--with_cam', action='store_true', default=False, help='use camera or not')
+    parser.add_argument('--with_radar', action='store_true', default=False, help='use radar or not')
     args = parser.parse_args()
 
     if args.func == 'create_nuscenes_infos':
@@ -423,9 +483,11 @@ if __name__ == '__main__':
             data_path=ROOT_DIR / 'data' / 'nuscenes',
             save_path=ROOT_DIR / 'data' / 'nuscenes',
             max_sweeps=dataset_cfg.MAX_SWEEPS,
-            with_cam=args.with_cam
+            with_cam=args.with_cam,
+            with_radar=args.with_radar,
         )
-
+        print("@@@@@@@@@@@@@@@@ No Create GT Database @@@@@@@@@@@@@@@@@@@")
+        exit()
         nuscenes_dataset = NuScenesDataset(
             dataset_cfg=dataset_cfg, class_names=None,
             root_path=ROOT_DIR / 'data' / 'nuscenes',

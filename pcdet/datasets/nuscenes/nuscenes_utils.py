@@ -309,7 +309,7 @@ def obtain_sensor2top(
     return sweep
 
 
-def fill_trainval_infos(data_path, nusc, train_scenes, val_scenes, test=False, max_sweeps=10, with_cam=False):
+def fill_trainval_infos(data_path, nusc, train_scenes, val_scenes, test=False, max_sweeps=10, with_cam=False, with_radar=False):
     train_nusc_infos = []
     val_nusc_infos = []
     progress_bar = tqdm.tqdm(total=len(nusc.sample), desc='create_info', dynamic_ncols=True)
@@ -378,7 +378,95 @@ def fill_trainval_infos(data_path, nusc, train_scenes, val_scenes, test=False, m
                 cam_info['data_path'] = Path(cam_info['data_path']).relative_to(data_path).__str__()
                 cam_info.update(camera_intrinsics=camera_intrinsics)
                 info["cams"].update({cam: cam_info})
-        
+
+        if with_radar:
+            info['radars'] = dict()
+
+            # obtain 5 radar's information per frame
+            radar_types = [
+                "RADAR_FRONT",
+                "RADAR_FRONT_RIGHT",
+                "RADAR_FRONT_LEFT",
+                "RADAR_BACK_LEFT",
+                "RADAR_BACK_RIGHT",
+            ]
+            for radar in radar_types:
+                radar_token = sample["data"][radar]
+
+                radar_sd_rec = nusc.get('sample_data', radar_token)
+                radar_cs_rec = nusc.get('calibrated_sensor', radar_sd_rec['calibrated_sensor_token'])
+                ref_pose_rec_radar_time = nusc.get('ego_pose', radar_sd_rec['ego_pose_token'])
+
+                radar_from_car = transform_matrix(
+                    radar_cs_rec['translation'], Quaternion(radar_cs_rec['rotation']), inverse=True
+                )
+                car_from_radar = transform_matrix(
+                    radar_cs_rec['translation'], Quaternion(radar_cs_rec['rotation']), inverse=False
+                )
+                global_from_car_radar_time = transform_matrix(
+                    ref_pose_rec_radar_time['translation'], Quaternion(ref_pose_rec_radar_time['rotation']), inverse=False,
+                )
+
+                tm_ref_from_radar = reduce(np.dot, [ref_from_car, car_from_global, global_from_car_radar_time, car_from_radar])
+                time_lag_radar = ref_time - 1e-6 * radar_sd_rec['timestamp']
+
+                radar_path, _, _ = nusc.get_sample_data(radar_token)
+                radar_info = {
+                    'data_path': Path(radar_path).relative_to(data_path).__str__(),
+                    'token': radar_token,
+                    'sweeps': [],
+                    'radar_from_car': radar_from_car,
+                    'transform_matrix': tm_ref_from_radar,
+                    'time_lag': time_lag_radar,
+                }
+
+                sweeps = []
+                while len(sweeps) < max_sweeps - 1:
+                    if radar_sd_rec['prev'] == '':
+                        if len(sweeps) == 0:
+                            sweep = {
+                                'radar_path': Path(radar_path).relative_to(data_path).__str__(),
+                                'sample_data_token': radar_token,
+                                'transform_matrix': tm_ref_from_radar,
+                                'time_lag': time_lag_radar,
+                            }
+                            sweeps.append(sweep)
+                        else:
+                            sweeps.append(sweeps[-1])
+                    else:
+                        radar_sd_rec = nusc.get('sample_data', radar_sd_rec['prev'])
+
+                        # Get past pose of radar
+                        current_pose_rec = nusc.get('ego_pose', radar_sd_rec['ego_pose_token'])
+                        global_from_car = transform_matrix(
+                            current_pose_rec['translation'], Quaternion(current_pose_rec['rotation']), inverse=False,
+                        )
+
+                        # Homogeneous transformation matrix from sensor coordinate frame to ego car frame.
+                        current_cs_rec = nusc.get(
+                            'calibrated_sensor', radar_sd_rec['calibrated_sensor_token']
+                        )
+                        car_from_current = transform_matrix(
+                            current_cs_rec['translation'], Quaternion(current_cs_rec['rotation']), inverse=False,
+                        )
+
+                        tm_ref_from_radar = reduce(np.dot, [ref_from_car, car_from_global, global_from_car, car_from_current])
+
+                        radar_path = nusc.get_sample_data_path(radar_sd_rec['token'])
+
+                        time_lag = ref_time - 1e-6 * radar_sd_rec['timestamp']
+
+                        sweep = {
+                            'radar_path': Path(radar_path).relative_to(data_path).__str__(),
+                            'sample_data_token': radar_sd_rec['token'],
+                            'transform_matrix': tm_ref_from_radar,
+                            'global_from_car': global_from_car,
+                            'car_from_current': car_from_current,
+                            'time_lag': time_lag,
+                        }
+                        sweeps.append(sweep)
+                radar_info['sweeps'] = sweeps
+                info["radars"].update({radar: radar_info})
 
         sample_data_token = sample['data'][chan]
         curr_sd_rec = nusc.get('sample_data', sample_data_token)
